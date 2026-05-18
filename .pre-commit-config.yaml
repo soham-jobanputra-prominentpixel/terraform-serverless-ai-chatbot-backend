@@ -5,6 +5,7 @@ repos:
     -   id: trailing-whitespace
     -   id: end-of-file-fixer
     -   id: check-yaml
+        args: [--allow-multiple-documents]
 
 -   repo: https://github.com/antonbabenko/pre-commit-terraform
     rev: v1.105.0
@@ -13,13 +14,9 @@ repos:
         args:
             - --args=-recursive
     -   id: terraform_tflint
-        args:
-            - --args=--call-module-type=all
-            - --args=--enable-rule=terraform_documented_variables
     -   id: terraform_validate
         args:
-            - --tf-init-args=-upgrade
-            - --tf-init-args=-lockfile=readonly
+            - --hook-config=--retry-once-with-cleanup=true
     -   id: terraform_docs
         args:
             - --args=--config=.terraform-docs.yml

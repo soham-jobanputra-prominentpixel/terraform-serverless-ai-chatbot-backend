@@ -1,0 +1,236 @@
+spec:
+  inputs:
+    environment:
+      default: dev
+      options:
+        - dev
+        - prod
+    destroy:
+      default: "no"
+      options:
+        - "yes"
+        - "no"
+
+---
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "web"
+
+variables:
+  TF_IN_AUTOMATION: true
+  TF_VERSION: "1.14.7"
+  AWS_DEFAULT_REGION: "us-east-1"
+  AWS_REGION: "us-east-1"
+  TF_ROOT: ${CI_PROJECT_DIR}
+  TF_WORKSPACE: "$[[ inputs.environment ]]"
+  DESTROY: "$[[ inputs.destroy ]]"
+
+stages:
+  - validate
+  - auth
+  - plan
+  - wait
+  - approve
+  - apply
+  - notify
+  - smoke-test
+
+# ── Input Validation ──────────────────────────────────────────────────────────
+
+validate environment:
+  stage: validate
+  image: alpine:latest
+  script:
+    - |
+      echo "Target environment: ${TF_WORKSPACE}"
+      case "${TF_WORKSPACE}" in
+        dev|prod)
+          echo "Environment is valid."
+          ;;
+        *)
+          echo "ERROR: Invalid TF_WORKSPACE '${TF_WORKSPACE}'. Must be one of: dev, prod."
+          exit 1
+          ;;
+      esac
+    - |
+      if [ ! -f "${TF_ROOT}/environments/${TF_WORKSPACE}.tfvars" ]; then
+        echo "ERROR: Missing tfvars file at environments/${TF_WORKSPACE}.tfvars"
+        exit 1
+      fi
+
+# ── Authentication ────────────────────────────────────────────────────────────
+
+assume role:
+  stage: auth
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.com
+  script:
+    # Exchange the OIDC token for short-lived AWS credentials
+    - >
+      aws_sts_output=$(aws sts assume-role-with-web-identity
+      --role-arn ${ROLE_ARN}
+      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}"
+      --web-identity-token ${GITLAB_OIDC_TOKEN}
+      --duration-seconds 3600
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]'
+      --output text)
+    - export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" $aws_sts_output)
+    - aws sts get-caller-identity
+    - printf "AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\nAWS_SESSION_TOKEN=%s\n" $aws_sts_output > aws.env
+  artifacts:
+    reports:
+      dotenv: aws.env
+    expire_in: 1 hour
+
+# ── Terraform Plan ────────────────────────────────────────────────────────────
+
+terraform plan:
+  stage: plan
+  image:
+    name: hashicorp/terraform:${TF_VERSION}
+    entrypoint: [""]
+  dependencies:
+    - assume role
+  before_script:
+    - terraform --version
+    - aws --version || apk add --no-cache aws-cli
+    - aws sts get-caller-identity
+    # Install tflint
+    - apk add --no-cache curl unzip
+    - curl -sSLO https://github.com/terraform-linters/tflint/releases/latest/download/tflint_linux_amd64.zip
+    - unzip tflint_linux_amd64.zip
+    - install -c -v tflint /usr/local/bin/
+    - tflint --version
+  script:
+    - cd ${TF_ROOT}
+    - terraform init -input=false
+    - terraform workspace show
+    - terraform fmt -recursive -check
+    - terraform validate
+    - tflint --init
+    - tflint
+    - |
+      PLAN_ARGS="-out=tfplan -var-file=environments/${TF_WORKSPACE}.tfvars -input=false"
+
+      if [ "${DESTROY}" = "yes" ]; then
+        PLAN_ARGS="${PLAN_ARGS} -destroy"
+      fi
+
+      terraform plan ${PLAN_ARGS}
+    - tar -cvf planned-terraform-config.tar .
+  artifacts:
+    paths:
+      - planned-terraform-config.tar
+    expire_in: 1 days
+  environment:
+    name: ${TF_WORKSPACE}
+
+# ── Cool-down Timer ───────────────────────────────────────────────────────────
+
+plan review timer:
+  stage: wait
+  image: alpine:latest
+  script:
+    - echo "Waiting 60 seconds before opening the approval gate..."
+    - sleep 60
+    - echo "Timer complete. Approval gate is now available."
+  dependencies: []
+
+# ── Manual Approval Gate ──────────────────────────────────────────────────────
+
+approve plan:
+  stage: approve
+  image: alpine:latest
+  when: manual
+  allow_failure: false
+  script:
+    - echo "Plan approved by ${GITLAB_USER_LOGIN} at $(date -u). Proceeding to apply."
+  dependencies: []
+
+# ── Terraform Apply ───────────────────────────────────────────────────────────
+
+terraform apply:
+  stage: apply
+  image:
+    name: hashicorp/terraform:${TF_VERSION}
+    entrypoint: [""]
+  dependencies:
+    - assume role
+    - terraform plan
+  before_script:
+    - aws --version || apk add --no-cache aws-cli
+
+    # STS session tokens last 3600 s; if the approval wait exceeds that the job
+    # will fail here with a clear auth error rather than a misleading apply error.
+    - aws sts get-caller-identity
+
+    - tar -xvf planned-terraform-config.tar
+    - terraform --version
+    - terraform workspace show
+  script:
+    - cd ${TF_ROOT}
+    - terraform apply -input=false tfplan
+    - terraform output -json > tf-outputs.json
+  environment:
+    name: ${TF_WORKSPACE}
+  artifacts:
+    paths:
+      - tf-outputs.json
+    expire_in: 1 days
+
+# ── Failure Notification ──────────────────────────────────────────────────────
+# Runs only when terraform apply fails. Logs a stub email notification;
+# replace the echo with a real send command
+# when you wire up an actual SMTP mechanism.
+
+notify apply failure:
+  stage: notify
+  image: alpine:latest
+  when: on_failure   # only runs if the apply job failed; skipped on success
+  dependencies: []
+  script:
+    - |
+      echo "============================================================"
+      echo "  APPLY FAILED — sending failure notification"
+      echo "  Recipient : ${GITLAB_USER_EMAIL}"
+      echo "  Subject   : [${TF_WORKSPACE}] Terraform apply failed — pipeline #${CI_PIPELINE_ID}"
+      echo "  Body      : Terraform apply failed for environment '${TF_WORKSPACE}'."
+      echo "              Pipeline : ${CI_PIPELINE_URL}"
+      echo "              Triggered by : ${GITLAB_USER_LOGIN}"
+      echo "              Destroy mode : ${DESTROY}"
+      echo "============================================================"
+      echo "Email sent successfully to ${GITLAB_USER_EMAIL}"
+
+# ── Smoke Tests ───────────────────────────────────────────────────────────────
+# Runs only after a successful apply and only when not in destroy mode
+# (there is nothing to test after infrastructure has been torn down).
+
+smoke tests:
+  stage: smoke-test
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  dependencies:
+    - assume role    # re-injects AWS credentials via dotenv artifact
+    - terraform apply
+  rules:
+    # Skip entirely on destroy runs — no infrastructure left to test
+    - if: $DESTROY == "yes"
+      when: never
+    # Run automatically after a successful apply on normal (non-destroy) runs
+    - when: on_success
+  before_script:
+    - aws --version
+    - aws sts get-caller-identity    # confirm credentials before running any tests
+    - cat tf-outputs.json
+  script:
+    - echo "Running smoke tests against environment ${TF_WORKSPACE}..."
+    # ── add your smoke test commands below ────────────────────────────────────
+    - aws lambda invoke --function-name "$(jq -r '.lambda_function_arn.value' tf-outputs.json)" output.json
+    - cat output.json
+    - jq --exit-status '.statusCode == 200' output.json
+    # ── end smoke tests ───────────────────────────────────────────────────────
+    - echo "Smoke tests completed."
+  environment:
+    name: ${TF_WORKSPACE}
