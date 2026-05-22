@@ -5,11 +5,14 @@
     "dictionaries": [],
     "words": [
         "EDITMSG",
+        "jobanputra",
+        "soham",
         "terraformrc",
         "tflint",
         "tfstate",
         "tfvars",
-        "venv"
+        "venv",
+        "xnem"
     ],
     "ignoreWords": [],
     "import": []
